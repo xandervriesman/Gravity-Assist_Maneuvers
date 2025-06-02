@@ -1,0 +1,669 @@
+import os
+import pytest
+import numpy as np
+from numpy import array, zeros
+import spiceypy as spice
+import math
+import matplotlib.pyplot as plt
+plt.style.use('dark_background')
+
+downloads_folder = os.path.expanduser("~") + "/Downloads/"
+
+# Load the files with given file path
+de432s = downloads_folder + "de432s.bsp"
+leapseconds_kernel = downloads_folder + "naif0012.tls"
+pck00010 = downloads_folder + "pck00010.tpc"
+voyager2_jupiter_flyby = downloads_folder + "voyager2_jupiter_flyby.bsp"
+voyager2_saturn_flyby = downloads_folder + "vgr2_sat337.bsp"
+voyager2_path = downloads_folder + "Voyager_2.m05016u.merged.bsp"
+nh_path = downloads_folder + "nh_recon_e2j_v1.bsp"
+
+def norm(v):
+    
+    return np.linalg.norm(v)
+
+  
+# Runge-kutta ODE function
+
+def runge_kutta(f, t, y, h):
+    k1 = f(t, y)
+    k2 = f(t+0.5*h, y+0.5*k1*h)
+    k3 = f(t+0.5*h, y+0.5*k2*h)
+    k4 = f(t+h, y+k3*h)
+
+    return y+h/6.0*(k1+2*k2+2*k3+k4)
+
+
+def lamberts_universal_variables(r0, r1, deltat, args):
+    
+    _args = {
+        'tm'       : 1,
+        'mu'       : sun['mu'],
+        'tol'      : 1e-6,
+        'max_steps': 200,
+        'psi'      : 0.0,
+        'psi_u'    : 4.0*math.pi**2,
+        'psi_l'    : -4.0*math.pi**2,
+    }
+    for key in args.keys():
+        _args[key] = args[key]
+    psi = _args['psi']
+    psi_l = _args['psi_l']
+    psi_u = _args['psi_u']
+
+    sqrt_mu = math.sqrt(_args['mu'])
+    r0_norm = norm(r0)
+    r1_norm = norm(r1)
+    gamma = np.dot(r0,r1)/r0_norm/r1_norm
+    c2 = 0.5
+    c3 = 1/6.0
+    solved = False
+    A = _args['tm']*math.sqrt(r0_norm * r1_norm*(1+gamma))
+
+    if A == 0.0:
+        raise RuntimeWarning('Universal variables solution was passed in Hohmann transfer')
+        return np.array([0,0,0]), np.array([0,0,0])
+
+    for n in range(_args['max_steps']):
+        B = r0_norm + r1_norm + A*(psi*c3 - 1)/math.sqrt(c2)
+
+        if A > 0.0 and B < 0.0:
+            psi_l += math.pi
+            B *= -1.0
+
+        chi3 = math.sqrt(B/c2)**3
+        deltat_ = (chi3*c3 + A*math.sqrt(B))/sqrt_mu
+
+        if abs(deltat - deltat_) < _args['tol']:
+            solved = True
+            break
+
+        if deltat_ <= deltat:
+            psi_l = psi
+
+        else:
+            psi_u = psi
+
+        psi = (psi_u + psi_l)/2.0
+        c2 = C2(psi)
+        c3 = C3(psi)
+
+    f = 1 - B/r0_norm
+    g = A*math.sqrt(B/_args['mu'])
+    gdot = 1 - B/r1_norm
+    v0 = (r1 - f*r0)/g
+    v1 = (gdot*r1 - r0)/g
+
+    return v0, v1
+
+def C2(psi):
+    return(1-math.cos(math.sqrt(np.abs(psi))))/np.abs(psi)
+
+
+def C3( psi ):
+    sqrt_psi = math.sqrt(np.abs(psi))
+    return(sqrt_psi - math.sin(sqrt_psi))/np.abs((psi*sqrt_psi))
+
+
+def coes2state(coes, mu=earth['mu'], deg = True):
+    a, e, i, ta, aop, raan = coes
+    if deg:
+        i *= d2r
+        ta *= d2r
+        aop *= d2r
+        raan *= d2r
+    
+    e = np.abs(e)
+    rp = a*(1 - e)
+    rp = np.abs(rp)
+
+    return spice.conics([rp, e, i, raan, aop, ta, 0, mu], 0)
+
+
+def two_body_motion(t, state, mu = earth['mu']):
+
+    r = state[:3]
+    r_ddot = -mu * r/np.linalg.norm(r) ** 3
+    return np.array([state[3], state[4], state[5], r_ddot[0], r_ddot[1], r_ddot[2]])
+
+  
+# Calc ephemeris state function
+
+def calc_ephemeris(target, ets, frame, observer):
+    
+    if type(target) == str:
+        return array( spice.spkezr(target, ets, frame, 'NONE', observer)[0])
+
+    else:
+        n_states = len(ets)
+        states = zeros((n_states, 6))
+        for n in range(n_states):
+            states[n] = spice.spkgeo(target, ets[ n ], frame, observer)[0]
+        return states
+
+
+def plot_velocities( ets, vs, args ):
+    _args = {
+        'figsize'          : ( 16, 8 ),
+        'dist_unit'        : 'km',
+        'time_unit'        : 'seconds',
+        'hlines'           : [],
+        'hline_lstyles'    : 'dotted',
+        'lw'               : 2,
+        'labelsize'        : 15,
+        'legend_fontsize'  : 20,
+        'legend_framealpha': 0.3,
+        'title'            : 'Trajectories',
+        'xlim'             : None,
+        'ylim'             : None,
+        'legend'           : True,
+        'show'             : False,
+        'filename'         : False,
+        'dpi'              : 300,
+    }
+    for key in args.keys():
+        _args[ key ] = args[ key ]
+
+    fig, ax0 = plt.subplots( 1, 1, figsize = _args[ 'figsize' ] )
+
+    _args[ 'xlabel' ] = time_handler[ _args[ 'time_unit' ] ][ 'xlabel' ]
+    time_coeff        = time_handler[ _args[ 'time_unit' ] ][ 'coeff'  ]
+
+    _ets   = ets.copy() - ets[ 0 ]
+    _ets  /= time_coeff
+    vnorms = np.linalg.norm( vs, axis = 1 )
+
+    if _args[ 'xlim' ] is None:
+        _args[ 'xlim' ] = [ 0, _ets[ -1 ] ]
+
+    if _args[ 'ylim' ] is None:
+        _args[ 'ylim' ] = [ vs.min(), vnorms.max() ]
+
+    ax0.plot( _ets, vs[ :, 0 ], 'r', label = r'$v_x$',
+        linewidth = _args[ 'lw' ] )
+    ax0.plot( _ets, vs[ :, 1 ], 'g', label = r'$v_y$',
+        linewidth = _args[ 'lw' ] )
+    ax0.plot( _ets, vs[ :, 2 ], 'b', label = r'$v_z$',
+        linewidth = _args[ 'lw' ]  )
+    ax0.plot( _ets, vnorms    , 'm', label = r'$Norms$',
+        linewidth = _args[ 'lw' ] )
+
+    ax0.grid( linestyle = 'dotted' )
+    ax0.set_xlim( _args[ 'xlim'   ] )
+    ax0.set_ylim( _args[ 'ylim' ] )
+    ax0.set_xlabel( _args[ 'xlabel' ], size = _args[ 'labelsize' ] )
+    ax0.set_ylabel( r'Velocity $(\dfrac{km}{s})$',
+        size = _args[ 'labelsize' ] )
+
+    for hline in _args[ 'hlines' ]:
+        ax0.hlines( hline[ 'val' ], _ets[ 0 ], _ets[ -1 ],
+            color     = hline[ 'color' ],
+            linewidth = _args[ 'lw' ],
+            linestyle = _args[ 'hline_lstyles' ] )
+
+    plt.suptitle( _args[ 'title' ] )
+    plt.tight_layout()
+
+    if _args[ 'legend' ]:
+        ax0.legend( fontsize = _args[ 'legend_fontsize' ],
+            loc = 'upper right', framealpha = _args[ 'legend_framealpha' ] )
+
+    if _args[ 'filename' ]:
+        plt.savefig( _args[ 'filename' ], dpi = _args[ 'dpi' ] )
+        print( 'Saved', _args[ 'filename' ] )
+
+    if _args[ 'show' ]:
+        plt.show()
+
+    plt.close()
+    
+    
+def plot_orbits( rs, args, vectors = [] ):
+    _args = {
+        'figsize'      : ( 18, 15 ),
+        'labels'       : [ '' ] * len( rs ),
+        'colors'       : COLORS[ : ],
+        'traj_lws'     : 3,
+        'dist_unit'    : 'km',
+        'groundtracks' : False,
+        'cb_radius'    : 6378.0,
+        'cb_SOI'       : None,
+        'cb_SOI_color' : 'c',
+        'cb_SOI_alpha' : 0.7,
+        'cb_axes'      : True,
+        'cb_axes_mag'  : 2,
+        'cb_cmap'      : 'Blues',
+        'cb_axes_color': 'w',
+        'axes_mag'     : 0.8,
+        'axes_custom'  : None,
+        'title'        : 'Trajectories',
+        'legend'       : True,
+        'axes_no_fill' : True,
+        'hide_axes'    : False,
+        'azimuth'      : False,
+        'elevation'    : False,
+        'show'         : False,
+        'filename'     : False,
+        'dpi'          : 300,
+        'vector_colors': [ '' ] * len( vectors ),
+        'vector_labels': [ '' ] * len( vectors ),
+        'vector_texts' : False
+    }
+    for key in args.keys():
+        _args[ key ] = args[ key ]
+
+    fig = plt.figure( figsize = _args[ 'figsize' ] )
+    ax  = fig.add_subplot( 111, projection = '3d'  )
+
+    max_val = 0
+    n       = 0
+
+    for r in rs:
+        _r = r.copy() * dist_handler[ _args[ 'dist_unit' ] ]
+
+        ax.plot( _r[ :, 0 ], _r[ :, 1 ], _r[ : , 2 ],
+            color = _args[ 'colors' ][ n ], label = _args[ 'labels' ][ n ],
+            zorder = 10, linewidth = _args[ 'traj_lws' ] )
+        ax.plot( [ _r[ 0, 0 ] ], [ _r[ 0 , 1 ] ], [ _r[ 0, 2 ] ], 'o',
+            color = _args[ 'colors' ][ n ] )
+
+        if _args[ 'groundtracks' ]:
+            rg  = _r / np.linalg.norm( r, axis = 1 ).reshape( ( r.shape[ 0 ], 1 ) )
+            rg *= _args[ 'cb_radius' ]
+
+            ax.plot( rg[ :, 0 ], rg[ :, 1 ], rg[ :, 2 ], cs[ n ], zorder = 10 )
+            ax.plot( [ rg[ 0, 0 ] ], [ rg[ 0, 1 ] ], [ rg[ 0, 2 ] ], cs[ n ] + 'o', zorder = 10 )			
+
+        max_val = max( [ _r.max(), max_val ] )
+        n += 1
+
+    for vector in vectors:
+        ax.quiver( 0, 0, 0,
+            vector[ 'r' ][ 0 ], vector[ 'r' ][ 1 ], vector[ 'r' ][ 2 ],
+            color = vector[ 'color' ], label = vector[ 'label' ] )
+
+        if _args[ 'vector_texts' ]:
+            vector[ 'r' ] *= _args[ 'vector_text_scale' ]
+            ax.text( vector[ 'r' ][ 0 ], vector[ 'r' ][ 1 ], vector[ 'r' ][ 2 ],
+                vector[ 'label' ],
+                color = vector[ 'color' ] )
+
+    _args[ 'cb_radius' ] *= dist_handler[ _args[ 'dist_unit' ] ]
+    _u, _v = np.mgrid[ 0:2*np.pi:20j, 0:np.pi:20j ]
+    _x     = _args[ 'cb_radius' ] * np.cos( _u ) * np.sin( _v )
+    _y     = _args[ 'cb_radius' ] * np.sin( _u ) * np.sin( _v )
+    _z     = _args[ 'cb_radius' ] * np.cos( _v )
+    ax.plot_surface( _x, _y, _z, cmap = _args[ 'cb_cmap' ], zorder = 1 )
+
+    if _args[ 'cb_SOI' ] is not None:
+        _args[ 'cb_SOI' ] *= dist_handler[ _args[ 'dist_unit' ] ]
+        _x *= _args[ 'cb_SOI' ] / _args[ 'cb_radius' ]
+        _y *= _args[ 'cb_SOI' ] / _args[ 'cb_radius' ]
+        _z *= _args[ 'cb_SOI' ] / _args[ 'cb_radius' ]
+        ax.plot_wireframe( _x, _y, _z,
+            color = _args[ 'cb_SOI_color' ],
+            alpha = _args[ 'cb_SOI_alpha' ] )
+
+    if _args[ 'cb_axes' ]:
+        l       = _args[ 'cb_radius' ] * _args[ 'cb_axes_mag' ]
+        x, y, z = [ [ 0, 0, 0 ], [ 0, 0, 0  ], [ 0, 0, 0 ] ]
+        u, v, w = [ [ l, 0, 0 ], [ 0, l, 0 ], [ 0, 0, l ] ]
+        ax.quiver( x, y, z, u, v, w, color = _args[ 'cb_axes_color' ] )
+
+    xlabel = 'X (%s)' % _args[ 'dist_unit' ]
+    ylabel = 'Y (%s)' % _args[ 'dist_unit' ]
+    zlabel = 'Z (%s)' % _args[ 'dist_unit' ]
+
+    if _args[ 'axes_custom' ] is not None:
+        max_val = _args[ 'axes_custom' ]
+    else:
+        max_val *= _args[ 'axes_mag' ]
+
+    ax.set_xlim( [ -max_val, max_val ] )
+    ax.set_ylim( [ -max_val, max_val ] )
+    ax.set_zlim( [ -max_val, max_val ] )
+    ax.set_xlabel( xlabel )
+    ax.set_ylabel( ylabel )
+    ax.set_zlabel( zlabel )
+    ax.set_box_aspect( [ 1, 1, 1 ] )
+    ax.set_aspect( 'auto' )
+
+    if _args[ 'azimuth' ] is not False:
+        ax.view_init( elev = _args[ 'elevation' ], azim = _args[ 'azimuth' ] )
+
+    if _args[ 'hide_axes' ]:
+        ax.set_axis_off()
+
+    if _args[ 'legend' ]:
+        plt.legend()
+
+    if _args[ 'filename' ]:
+        plt.savefig( _args[ 'filename' ], dpi = _args[ 'dpi' ] )
+        print( 'Saved', _args[ 'filename' ] )
+
+    if _args[ 'show' ]:
+        plt.show()
+
+    plt.close()
+
+  
+# planetary data
+
+G = 6.67430e-20 # km**3/ kg / s**2
+
+venus = {
+        'name'            : 'Venus',
+        'spice_name'      : 'VENUS BARYCENTER',
+        'SPICE_ID'        : 2,
+        'mass'            : 7.348e24,
+        'mu'              : 7.348e24 * G,
+        'radius'          : 6051.8,
+        'body_fixed_frame': 'IAU_VENUS',
+        }
+
+earth = {
+        'name'            : 'Earth',
+        'spice_name'      : 'EARTH',
+        'SPICE_ID'        : 399,
+        'mass'            : 5.972e24,
+        'mu'              : 5.972e24 * G,
+        'radius'          : 6378.0,
+        'J2'              : 1.081874e-3,
+        'body_fixed_frame': 'IAU_EARTH',
+        }
+
+mars = {
+        'name'            : 'Mars',
+        'spice_name'      : 'MARS BARYCENTER',
+        'SPICE_ID'        : 4,
+        'mass'            : 6.39e23,
+        'mu'              : 4.282837362069909E+04,
+        'radius'          : 3397.0,
+        'body_fixed_frame': 'IAU_MARS',
+        }
+
+jupiter = {
+        'name'            : 'Jupiter',
+        'spice_name'      : 'JUPITER BARYCENTER',
+        'SPICE_ID'        : 5,
+        'mass'            : 1.898e27,
+        'mu'              : 1.26686e8,
+        'radius'          : 71490.0,   # km
+        'body_fixed_frame': 'IAU_JUPITER',
+}
+
+saturn = {
+        'name'            : 'Saturn',
+        'spice_name'      : 'SATURN BARYCENTER',
+        'SPICE_ID'        : 6,
+        'mass'            : 568.34e24,
+        'radius'          : 58232.0,
+        'mu'              : 37.931e6,
+        'body_fixed_fram' : 'IAU_SATURN'
+}
+
+uranus = {
+        'name'            : 'Uranus',
+        'spice_name'      : 'URANUS BARYCENTER',
+        'SPICE_ID'        : 7,
+        'mass'            : 8.68103e25,
+        'mu'              : 8.68103e25 * G,
+        'radius'          : 25559,   # km
+        'body_fixed_frame': 'IAU_URANUS',
+}
+
+neptune = {
+        'name'            : 'Neptune',
+        'spice_name'      : 'NEPTUNE BARYCENTER',
+        'SPICE_ID'        : 8,
+        'mass'            : 102.409e24,
+        'mu'              : 102.409e24 * G,
+        'radius'          : 24764,   # km
+        'body_fixed_frame': 'IAU_NEPTUNE',
+}
+
+sun = {
+        'name'            : 'Sun',
+        'SPICE_ID'        : 10,
+        'mass'            : 1.989e30,
+        'mu'              : 1.3271244004193938E+11,
+        'radius'          : 695510.0,
+}
+
+bodies = [venus, earth, mars, jupiter, saturn, uranus, neptune, sun]
+
+COLORS = [ 
+    'm', 'deeppink', 'chartreuse', 'w', 'springgreen', 'peachpuff',
+    'white', 'lightpink', 'royalblue', 'lime', 'aqua' ] * 100
+
+time_handler = {
+    'seconds': { 'coeff': 1.0,        'xlabel': 'Time (seconds)' },
+    'hours'  : { 'coeff': 3600.0,     'xlabel': 'Time (hours)'   },
+    'days'   : { 'coeff': 86400.0,    'xlabel': 'Time (days)'    },
+    'years'  : { 'coeff': 31536000.0, 'xlabel': 'Time (years)'   }
+}
+
+dist_handler = {
+    'km'    : 1.0,
+    'ER'    : 1 / 6378.0,
+    'JR'    : 1 / 71490.0,
+    'AU'    : 6.68459e-9,
+    r'$\dfrac{km}{s}$': 1.0
+}
+
+for body in bodies:
+    body['diameter'] = 2*body['radius']
+
+sec2day = 1.0/3600.0/24.0
+r2d = 180.0/np.pi
+d2r = 1.0/r2d
+
+  
+# New Jupyter Notebook cell
+
+# Voyager 2 trajectory until April 24, 2024
+
+if __name__ == '__main__':
+    
+    spice.furnsh(de432s)
+    spice.furnsh(voyager2_path)
+    spice.furnsh(leapseconds_kernel)
+    
+    t0 = spice.str2et('1977-08-21 TDB')
+    tf = spice.str2et('2024-04-24')
+    ets = np.arange(t0, tf, 10000.0)
+    
+    sun_states = calc_ephemeris(10, ets, 'ECLIPJ2000', 0)
+    earth_states = calc_ephemeris(399, ets, 'ECLIPJ2000', 10)
+    saturn_states = calc_ephemeris(6, ets, 'ECLIPJ2000', 10)
+    mars_states = calc_ephemeris(4, ets, 'ECLIPJ2000', 10)
+    jupiter_states = calc_ephemeris(5, ets, 'ECLIPJ2000', 10)
+    voyager2_states = calc_ephemeris(-32, ets, 'ECLIPJ2000', 10)
+    mercury_states = calc_ephemeris(199, ets, 'ECLIPJ2000', 10)
+    neptune_states = calc_ephemeris(8, ets, 'ECLIPJ2000', 10)
+    pluto_states = calc_ephemeris(9, ets, 'ECLIPJ2000', 10)
+    uranus_states = calc_ephemeris(7, ets, 'ECLIPJ2000', 10)
+    venus_states = calc_ephemeris(2, ets, 'ECLIPJ2000', 10)
+    
+    plot_orbits([sun_states, mercury_states, venus_states, earth_states, mars_states, jupiter_states, saturn_states, uranus_states, neptune_states, pluto_states, voyager2_states],
+        {
+        'labels'  : [ 'Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Voyager 2' ],
+        'colors'  : [ 'yellow', 'green', 'yellow', 'blue', 'red', 'orange', 'brown', 'purple', 'pink', 'black', 'white' ],
+        'traj_lws': 2,
+        'cb_radius': sun[ 'radius' ],
+        'cb_cmap'  : 'autumn',
+        'dist_unit': 'km',
+        'azimuth'  :  90,
+        'elevation':  90,
+        'axes_mag' : 2.7,
+        'title'    : 'Voyager 2 Trajectory',
+        'show'     : True
+        })
+    
+spice.kclear()
+
+# New Jupiter Notebook cell
+
+# Voyager 2 trajectory to Jupiter
+
+if __name__ == '__main__':
+    
+    spice.furnsh(de432s)
+    spice.furnsh(voyager2_path)
+    spice.furnsh(leapseconds_kernel)
+    
+    et = spice.str2et('1977-08-21 TDB')
+    dt = spice.str2et('1979-07-11 TDB')
+    ets = np.arange(et, dt, 5000.0)
+    
+    #sun_states = calc_ephemeris( 10, ets, 'ECLIPJ2000', 0)
+    earth_states = calc_ephemeris(399, ets, 'ECLIPJ2000', 0)
+    saturn_states = calc_ephemeris(6, ets, 'ECLIPJ2000', 0)
+    mars_states = calc_ephemeris(4, ets, 'ECLIPJ2000', 0)
+    jupiter_states = calc_ephemeris(5, ets, 'ECLIPJ2000', 0)
+    voyager2_states = calc_ephemeris(-32, ets, 'ECLIPJ2000', 10)
+    mercury_states = calc_ephemeris(199, ets, 'ECLIPJ2000', 10)
+    neptune_states = calc_ephemeris(8, ets, 'ECLIPJ2000', 10)
+    pluto_states = calc_ephemeris(9, ets, 'ECLIPJ2000', 10)
+    uranus_states = calc_ephemeris(7, ets, 'ECLIPJ2000', 10)
+    venus_states = calc_ephemeris(2, ets, 'ECLIPJ2000', 10)
+    
+    print('Final Voyager 2 state: ' + str(voyager2_states[-1]))
+    
+    plot_orbits([mercury_states, venus_states, earth_states, mars_states, jupiter_states, voyager2_states],
+        {
+        'labels'  : ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Voyager 2'],
+        'colors'  : ['gray', 'yellow', 'blue', 'red', 'orange', 'white'],
+        'traj_lws': 2,
+        'cb_radius': sun['radius'],
+        'cb_cmap'  : 'autumn',
+        'dist_unit': 'km',
+        'azimuth'  :  90,
+        'elevation':  90,
+        'axes_mag' : 1.1,
+        'show'     : True
+        })
+    
+spice.kclear()
+
+# New Jupyter Notebook cell
+
+# Voyager 2 flyby wrt Jupiter
+
+if __name__ == '__main__':
+    spice.furnsh(leapseconds_kernel)
+    spice.furnsh(voyager2_jupiter_flyby)
+
+    et = spice.str2et('1979-07-11 TDB')
+    dt = 20 * 24 * 3600.0
+    ets = np.arange( et - dt, et + dt, 5000.0 )
+    states = calc_ephemeris( -32, ets, 'ECLIPJ2000', 5 )
+
+    plot_orbits([states[:,:3]],
+    {
+    'labels'   : ['Voyager 2'],
+    'colors'   : ['w'],
+    'cb_radius': jupiter['radius'],
+    'cb_cmap'  : 'Oranges',
+    'dist_unit': 'km',
+    'azimuth'  : 0,
+    'elevation':  90,
+    'axes_mag' : 0.4,
+    'show'     : True
+    } )
+
+    hline = {'val':norm(states[0,3:]), 'color':'m'}
+    plot_velocities(ets, states[:,3:], 
+        {
+        'time_unit': 'hours',
+        'hlines'   : [hline],
+        'show'     : True
+        })
+    
+spice.kclear()
+
+# New Jupyter Notebook cell
+
+# Re-define two-body ODE with Sun's mu instead of Earth's
+
+def two_body_motion(t, state, mu = sun['mu']):
+    r = state[:3]
+    r_ddot = -mu*r/np.linalg.norm(r)**3
+    return np.array([state[3], state[4], state[5], r_ddot[0], r_ddot[1], r_ddot[2]])
+
+
+# New Horizons Lambert solver and ODE propagation
+
+if __name__ == '__main__':
+    
+    spice.furnsh(de432s)
+    spice.furnsh(leapseconds_kernel)
+    t0 = spice.str2et('2006-01-19 TDB')
+    tf = spice.str2et('2007-03-01 TDB')
+    dt = 1000
+    
+    delta_t = tf-t0
+    time_array = np.linspace(t0, tf, dt)
+    
+    sun_positions = calc_ephemeris(10, time_array, 'ECLIPJ2000', 0)
+    mercury_positions = calc_ephemeris(199, time_array, 'ECLIPJ2000', 10)
+    venus_positions = calc_ephemeris(2, time_array, 'ECLIPJ2000', 10)
+    earth_positions = calc_ephemeris(399, time_array, 'ECLIPJ2000', 10)
+    mars_positions = calc_ephemeris(4, time_array, 'ECLIPJ2000', 10)
+    jupiter_positions = calc_ephemeris(5, time_array, 'ECLIPJ2000', 10)
+    
+    nh_r0 = earth_positions[0,:3]
+    final_jupiter_state = calc_ephemeris(5, [tf], 'ECLIPJ2000', 10)
+    nh_rf = jupiter_positions[-1,:3]
+    
+    nh_v0, nh_vf = lamberts_universal_variables(nh_r0, nh_rf, delta_t, {'mu': sun['mu']})
+    print('Initial Velocity Array (km/s): ' + str(nh_v0))
+    print('Initial Velocity (km/s):' +str(np.dot(nh_v0, nh_v0)/100))
+    
+    nh_initial_state = nh_r0.tolist()+nh_v0.tolist()
+
+    steps = int(delta_t/dt)
+    ets = np.zeros((steps, 1))
+    nh_states = np.zeros((steps, 6))
+    nh_states[0] = nh_initial_state
+
+    for step in range(steps - 1):
+        nh_states[step + 1] = runge_kutta(two_body_motion, ets[step], nh_states[step], dt)
+        
+    print('Final New Horizon state is: ' + str(nh_states[-1]))
+        
+    plot_orbits([sun_positions, mercury_positions, venus_positions, earth_positions, mars_positions, jupiter_positions, nh_states],
+        {
+        'labels'  : ['Sun', 'Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'New Horizons'],
+        'colors'  : ['yellow', 'green', 'yellow', 'blue', 'red', 'orange', 'white'],
+        'traj_lws': 2,
+        'cb_radius': sun['radius'],
+        'cb_cmap'  : 'autumn',
+        'dist_unit': 'km',
+        'azimuth'  :  90,
+        'elevation':  90,
+        'axes_mag' : 3.4,
+        'show'    : True
+        } )
+    
+spice.kclear()
+
+# New Horizons final state
+
+if __name__ == '__main__':
+    
+    spice.furnsh(de432s)
+    spice.furnsh(leapseconds_kernel)
+    spice.furnsh(nh_path)
+    t0 = spice.str2et('2007-02-28 TDB')
+    tf = spice.str2et('2007-03-01 TDB')
+    dt = 1000
+    
+    delta_t = tf-t0
+    time_array = np.linspace(t0, tf, dt)
+    
+    nh_states = calc_ephemeris(-98, time_array, 'ECLIPJ2000', 10)
+    
+    print(nh_states[-1])
+    
+spice.kclear()
